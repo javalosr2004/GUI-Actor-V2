@@ -1,7 +1,15 @@
 import io
 import math
+import os
 from contextlib import asynccontextmanager
 from typing import Optional
+
+# Prevent transformers from eagerly importing TensorFlow/Flax, which on Colab
+# pulls in googleapiclient -> httplib2 -> pyparsing and can fail with version
+# mismatches. We only use the PyTorch backend.
+os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("USE_FLAX", "0")
 
 import torch
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile

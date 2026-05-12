@@ -21,3 +21,4 @@ fastapi
 uvicorn[standard]
 python-multipart
 rfdetr
+pyparsing>=3.0
