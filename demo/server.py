@@ -17,7 +17,7 @@ os.environ.setdefault("USE_FLAX", "0")
 
 import torch
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from PIL import Image
+from PIL import Image, ImageDraw
 from transformers import AutoProcessor
 
 from gui_actor.constants import chat_template  # noqa: F401  (imported for parity with demo/app.py)
@@ -30,6 +30,7 @@ MAX_PIXELS = 1920 * 1080
 
 LOG_DIR = Path(os.environ.get("PREDICT_LOG_DIR", Path(__file__).resolve().parent / "logs"))
 LOG_IMAGES_DIR = LOG_DIR / "images"
+LOG_OVERLAYS_DIR = LOG_DIR / "overlays"
 LOG_JSONL = LOG_DIR / "requests.jsonl"
 LOGGING_ENABLED = os.environ.get("PREDICT_LOG_DISABLED", "0") != "1"
 
@@ -121,6 +122,49 @@ def _save_image_bytes(data: bytes, original_filename: Optional[str]) -> str:
     dest = LOG_IMAGES_DIR / filename
     if not dest.exists():
         dest.write_bytes(data)
+    return filename
+
+
+def _save_overlay(
+    base_image: Image.Image,
+    detections: list,
+    point_px: tuple,
+    selected_bbox: Optional[list],
+    bbox_source: str,
+    input_sha: str,
+    request_ts: float,
+) -> str:
+    """Draw all UI-DETR detections, the GUI-Actor point, and highlight the
+    selected bbox. Saved under logs/overlays/<sha>_<ts_ms>.png."""
+    LOG_OVERLAYS_DIR.mkdir(parents=True, exist_ok=True)
+
+    canvas = base_image.copy().convert("RGB")
+    draw = ImageDraw.Draw(canvas)
+
+    # All detections in muted yellow
+    for det in detections:
+        x1, y1, x2, y2 = det["bbox"]
+        draw.rectangle([x1, y1, x2, y2], outline=(255, 200, 0), width=2)
+        label = f"{det['label']}:{det['score']:.2f}"
+        draw.text((x1 + 2, max(0, y1 - 12)), label, fill=(255, 200, 0))
+
+    # Selected bbox in green (if any) — drawn after so it sits on top
+    if selected_bbox is not None:
+        x1, y1, x2, y2 = selected_bbox
+        color = (0, 200, 0) if bbox_source == "contained_highest_score" else (255, 140, 0)
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=5)
+        draw.text((x1 + 4, max(0, y1 - 14)), f"selected ({bbox_source})", fill=color)
+
+    # GUI-Actor point in red, drawn last so it always shows
+    px, py = point_px
+    r = 10
+    draw.ellipse([px - r, py - r, px + r, py + r], outline=(255, 0, 0), width=4)
+    draw.line([px - r - 4, py, px + r + 4, py], fill=(255, 0, 0), width=2)
+    draw.line([px, py - r - 4, px, py + r + 4], fill=(255, 0, 0), width=2)
+
+    ts_ms = int(request_ts * 1000)
+    filename = f"{input_sha[:12]}_{ts_ms}.png"
+    canvas.save(LOG_OVERLAYS_DIR / filename, "PNG")
     return filename
 
 
@@ -249,15 +293,30 @@ async def predict(
         response["bbox_label"] = selected["label"]
 
     if LOGGING_ENABLED:
+        ts_now = time.time()
         input_saved = _save_image_bytes(input_bytes, input_image.filename)
         ref_saved = (
             _save_image_bytes(ref_bytes, reference_image.filename)
             if ref_bytes is not None and reference_image is not None
             else None
         )
+        try:
+            overlay_saved = _save_overlay(
+                base_image=img,
+                detections=detections,
+                point_px=point_px,
+                selected_bbox=selected["bbox"] if selected is not None else None,
+                bbox_source=source,
+                input_sha=Path(input_saved).stem,
+                request_ts=ts_now,
+            )
+        except Exception as e:
+            print(f"[log] failed to save overlay: {e}")
+            overlay_saved = None
+
         _log_request({
-            "ts": time.time(),
-            "latency_s": round(time.time() - t_start, 3),
+            "ts": ts_now,
+            "latency_s": round(ts_now - t_start, 3),
             "request": {
                 "input_image_file": input_saved,
                 "input_image_filename": input_image.filename,
@@ -266,6 +325,7 @@ async def predict(
                 "instruction": instruction,
                 "score_threshold": score_threshold,
             },
+            "overlay_file": overlay_saved,
             "response": response,
         })
 
