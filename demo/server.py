@@ -88,6 +88,64 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="GUI-Actor + UI-DETR", lifespan=lifespan)
 
 
+class WireTimingMiddleware:
+    """Logs wire-level timing for /predict: bytes/time spent receiving the
+    request body, server think-time between last byte in and first byte out,
+    and bytes/time spent sending the response."""
+
+    def __init__(self, app, path_prefix: str = "/predict"):
+        self.app = app
+        self.path_prefix = path_prefix
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http" or not scope.get("path", "").startswith(self.path_prefix):
+            await self.app(scope, receive, send)
+            return
+
+        first_in = last_in = first_out = last_out = None
+        bytes_in = 0
+        bytes_out = 0
+
+        async def recv():
+            nonlocal first_in, last_in, bytes_in
+            msg = await receive()
+            if msg["type"] == "http.request":
+                now = time.perf_counter()
+                if first_in is None:
+                    first_in = now
+                bytes_in += len(msg.get("body", b""))
+                if not msg.get("more_body"):
+                    last_in = now
+            return msg
+
+        async def snd(msg):
+            nonlocal first_out, last_out, bytes_out
+            if msg["type"] == "http.response.start":
+                first_out = time.perf_counter()
+            elif msg["type"] == "http.response.body":
+                bytes_out += len(msg.get("body", b""))
+                if not msg.get("more_body"):
+                    last_out = time.perf_counter()
+            await send(msg)
+
+        await self.app(scope, recv, snd)
+
+        def ms(a, b):
+            return (b - a) * 1000 if (a is not None and b is not None) else 0.0
+
+        wire_in_ms = ms(first_in, last_in)
+        think_ms = ms(last_in, first_out)
+        wire_out_ms = ms(first_out, last_out)
+        total_ms = ms(first_in, last_out)
+        print(f"[wire] in={wire_in_ms:.0f}ms ({bytes_in/1024:.0f}KB) "
+              f"think={think_ms:.0f}ms "
+              f"out={wire_out_ms:.0f}ms ({bytes_out/1024:.1f}KB) "
+              f"total={total_ms:.0f}ms")
+
+
+app.add_middleware(WireTimingMiddleware)
+
+
 @app.get("/health")
 def health():
     return {
