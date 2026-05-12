@@ -3,6 +3,7 @@ from gui_actor.modeling_qwen25vl import Qwen2_5_VLForConditionalGenerationWithPo
 from gui_actor.inference import inference
 from transformers import AutoProcessor
 from PIL import Image, ImageDraw
+import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 import torch
 import hashlib
@@ -234,6 +235,65 @@ def _save_overlay(
     return filename
 
 
+def _save_attn_heatmap(
+    base_image: Image.Image,
+    attn_scores: list,
+    n_width: int,
+    n_height: int,
+    point_px: tuple,
+    selected_bbox: Optional[list],
+    input_sha: str,
+    request_ts: float,
+) -> str:
+    """Render attn_scores as a jet heatmap, blended over the screenshot, with
+    the selected point/bbox drawn on top. Saved next to the regular overlay so
+    you can eyeball where the pointer head is actually looking."""
+    LOG_OVERLAYS_DIR.mkdir(parents=True, exist_ok=True)
+
+    w, h = base_image.size
+    expected = n_width * n_height
+    scores = np.array(attn_scores[0], dtype=np.float32).reshape(-1)
+    if scores.size < expected:
+        return ""
+    scores = scores[:expected].reshape(n_height, n_width)
+
+    lo, hi = float(scores.min()), float(scores.max())
+    norm = (scores - lo) / (hi - lo) if hi > lo else np.zeros_like(scores)
+
+    # Jet-ish colormap done by hand (avoids matplotlib dep at request time).
+    # Maps 0..1 → blue → cyan → green → yellow → red.
+    def jet(v: np.ndarray) -> np.ndarray:
+        r = np.clip(1.5 - np.abs(4 * v - 3), 0, 1)
+        g = np.clip(1.5 - np.abs(4 * v - 2), 0, 1)
+        b = np.clip(1.5 - np.abs(4 * v - 1), 0, 1)
+        return np.stack([r, g, b], axis=-1)
+
+    colored = (jet(norm) * 255).astype(np.uint8)
+    heat = Image.fromarray(colored, "RGB").resize((w, h), resample=Image.BILINEAR)
+    blended = Image.blend(base_image.convert("RGB"), heat, alpha=0.5)
+
+    draw = ImageDraw.Draw(blended)
+    if selected_bbox is not None:
+        x1, y1, x2, y2 = selected_bbox
+        draw.rectangle([x1, y1, x2, y2], outline=(0, 255, 0), width=4)
+    px, py = point_px
+    r = 10
+    draw.ellipse([px - r, py - r, px + r, py + r],
+                 outline=(255, 255, 255), width=4)
+    draw.line([px - r - 4, py, px + r + 4, py], fill=(255, 255, 255), width=2)
+    draw.line([px, py - r - 4, px, py + r + 4], fill=(255, 255, 255), width=2)
+
+    # Annotate the threshold value used by region extraction.
+    draw.text((6, 6),
+              f"attn min={lo:.3f} max={hi:.3f} thresh@0.3={hi * 0.3:.3f}",
+              fill=(255, 255, 255))
+
+    ts_ms = int(request_ts * 1000)
+    filename = f"{input_sha[:12]}_{ts_ms}_attn.png"
+    blended.save(LOG_OVERLAYS_DIR / filename, "PNG")
+    return filename
+
+
 def _log_request(entry: dict) -> None:
     if not LOGGING_ENABLED:
         return
@@ -443,6 +503,22 @@ async def predict(
             print(f"[log] failed to save overlay: {e}")
             overlay_saved = None
 
+        attn_overlay_saved = None
+        if pred.get("attn_scores") is not None and pred.get("n_width") and pred.get("n_height"):
+            try:
+                attn_overlay_saved = _save_attn_heatmap(
+                    base_image=img,
+                    attn_scores=pred["attn_scores"],
+                    n_width=pred["n_width"],
+                    n_height=pred["n_height"],
+                    point_px=point_px,
+                    selected_bbox=selected_bbox,
+                    input_sha=Path(input_saved).stem,
+                    request_ts=ts_now,
+                )
+            except Exception as e:
+                print(f"[log] failed to save attn heatmap: {e}")
+
         _log_request({
             "ts": ts_now,
             "latency_s": round(ts_now - t_start, 3),
@@ -461,6 +537,7 @@ async def predict(
                 "score_threshold": score_threshold,
             },
             "overlay_file": overlay_saved,
+            "attn_overlay_file": attn_overlay_saved,
             "response": response,
         })
         save_ms = (time.perf_counter() - t_send_start) * 1000
