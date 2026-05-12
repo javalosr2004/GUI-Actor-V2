@@ -383,7 +383,6 @@ def _select_bbox(detections, point_px):
 
 
 @app.post("/predict")
-@torch.inference_mode()
 async def predict(
     input_image: UploadFile = File(...),
     reference_image: Optional[UploadFile] = File(None),
@@ -415,14 +414,15 @@ async def predict(
 
     t_fwd_start = time.perf_counter()
     try:
-        pred = inference(
-            conversation,
-            app.state.model,
-            app.state.tokenizer,
-            app.state.data_processor,
-            use_placeholder=True,
-            topk=3,
-        )
+        with torch.inference_mode():
+            pred = inference(
+                conversation,
+                app.state.model,
+                app.state.tokenizer,
+                app.state.data_processor,
+                use_placeholder=True,
+                topk=3,
+            )
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"GUI-Actor inference failed: {e}")
