@@ -208,6 +208,29 @@ def _build_conversation(input_image: Image.Image, reference_image: Optional[Imag
     return conversation
 
 
+def _attention_bbox(region_points, n_width, n_height, image_size):
+    """Build a pixel bbox covering all patches in the highest-attention region.
+
+    `region_points` is a list of (cx, cy) normalized patch-center coords (already
+    shifted by +0.5/n). Invert that shift to recover integer (col, row) patch
+    indices, then take the union of the patch cells as the bbox.
+    """
+    if not region_points:
+        return None
+    w, h = image_size
+    cols, rows = [], []
+    for cx, cy in region_points:
+        col = int(round(cx * n_width - 0.5))
+        row = int(round(cy * n_height - 0.5))
+        cols.append(max(0, min(n_width - 1, col)))
+        rows.append(max(0, min(n_height - 1, row)))
+    x1 = min(cols) / n_width * w
+    y1 = min(rows) / n_height * h
+    x2 = (max(cols) + 1) / n_width * w
+    y2 = (max(rows) + 1) / n_height * h
+    return [x1, y1, x2, y2]
+
+
 def _select_bbox(detections, point_px):
     """Return (selected_det, source) per the user-confirmed rule."""
     if not detections:
@@ -237,6 +260,7 @@ async def predict(
     reference_image: Optional[UploadFile] = File(None),
     instruction: Optional[str] = Form(None),
     score_threshold: float = Form(0.3),
+    use_ui_detr: bool = Form(False),
 ):
     t_start = time.time()
     img, input_bytes = await _read_image(input_image)
@@ -270,8 +294,30 @@ async def predict(
     w, h = img.size
     point_px = (px_norm * w, py_norm * h)
 
-    detections = app.state.ui_detr.detect(img, score_threshold=score_threshold)
-    selected, source = _select_bbox(detections, point_px)
+    if use_ui_detr:
+        detections = app.state.ui_detr.detect(img, score_threshold=score_threshold)
+        selected, source = _select_bbox(detections, point_px)
+        selected_bbox = selected["bbox"] if selected is not None else None
+        selected_score = selected["score"] if selected is not None else None
+        selected_label = selected["label"] if selected is not None else None
+    else:
+        detections = []
+        top_region_patches = pred.get("topk_points_all") or []
+        attn_bbox = _attention_bbox(
+            top_region_patches[0] if top_region_patches else [],
+            pred["n_width"],
+            pred["n_height"],
+            (w, h),
+        )
+        if attn_bbox is None:
+            selected_bbox = None
+            selected_score = None
+            source = "no_attention_region"
+        else:
+            selected_bbox = attn_bbox
+            selected_score = pred["topk_values"][0] if pred.get("topk_values") else None
+            source = "attention_region"
+        selected_label = None
 
     response = {
         "point": {"x": float(px_norm), "y": float(py_norm)},
@@ -285,12 +331,12 @@ async def predict(
         "num_detections": len(detections),
     }
 
-    if selected is not None:
-        x1, y1, x2, y2 = selected["bbox"]
+    if selected_bbox is not None:
+        x1, y1, x2, y2 = selected_bbox
         response["bbox_pixel"] = {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
         response["bbox"] = {"x1": x1 / w, "y1": y1 / h, "x2": x2 / w, "y2": y2 / h}
-        response["bbox_score"] = selected["score"]
-        response["bbox_label"] = selected["label"]
+        response["bbox_score"] = selected_score
+        response["bbox_label"] = selected_label
 
     if LOGGING_ENABLED:
         ts_now = time.time()
@@ -305,7 +351,7 @@ async def predict(
                 base_image=img,
                 detections=detections,
                 point_px=point_px,
-                selected_bbox=selected["bbox"] if selected is not None else None,
+                selected_bbox=selected_bbox,
                 bbox_source=source,
                 input_sha=Path(input_saved).stem,
                 request_ts=ts_now,
