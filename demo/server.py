@@ -4,7 +4,7 @@ from gui_actor.inference import inference
 from transformers import AutoProcessor
 from PIL import Image, ImageDraw
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 import torch
 import hashlib
 import io
@@ -307,6 +307,89 @@ def _log_request(entry: dict) -> None:
         print(f"[log] failed to write request log: {e}")
 
 
+def _persist_request_artifacts(
+    *,
+    input_bytes: bytes,
+    input_filename: Optional[str],
+    ref_bytes: Optional[bytes],
+    ref_filename: Optional[str],
+    img: Image.Image,
+    detections: list,
+    point_px: tuple,
+    selected_bbox: Optional[list],
+    source: str,
+    pred: dict,
+    instruction: Optional[str],
+    score_threshold: float,
+    response: dict,
+    ts_now: float,
+    t_start: float,
+    upload_ms: float,
+    forward_ms: float,
+    post_ms: float,
+) -> None:
+    t_save = time.perf_counter()
+    input_saved = _save_image_bytes(input_bytes, input_filename)
+    ref_saved = (
+        _save_image_bytes(ref_bytes, ref_filename)
+        if ref_bytes is not None
+        else None
+    )
+
+    try:
+        overlay_saved = _save_overlay(
+            base_image=img,
+            detections=detections,
+            point_px=point_px,
+            selected_bbox=selected_bbox,
+            bbox_source=source,
+            input_sha=Path(input_saved).stem,
+            request_ts=ts_now,
+        )
+    except Exception as e:
+        print(f"[log] failed to save overlay: {e}")
+        overlay_saved = None
+
+    attn_overlay_saved = None
+    if pred.get("attn_scores") is not None and pred.get("n_width") and pred.get("n_height"):
+        try:
+            attn_overlay_saved = _save_attn_heatmap(
+                base_image=img,
+                attn_scores=pred["attn_scores"],
+                n_width=pred["n_width"],
+                n_height=pred["n_height"],
+                point_px=point_px,
+                selected_bbox=selected_bbox,
+                input_sha=Path(input_saved).stem,
+                request_ts=ts_now,
+            )
+        except Exception as e:
+            print(f"[log] failed to save attn heatmap: {e}")
+
+    _log_request({
+        "ts": ts_now,
+        "latency_s": round(ts_now - t_start, 3),
+        "timings_ms": {
+            "upload": round(upload_ms, 1),
+            "forward": round(forward_ms, 1),
+            "post": round(post_ms, 1),
+            "total": round((ts_now - t_start) * 1000, 1),
+        },
+        "request": {
+            "input_image_file": input_saved,
+            "input_image_filename": input_filename,
+            "reference_image_file": ref_saved,
+            "reference_image_filename": ref_filename,
+            "instruction": instruction,
+            "score_threshold": score_threshold,
+        },
+        "overlay_file": overlay_saved,
+        "attn_overlay_file": attn_overlay_saved,
+        "response": response,
+    })
+    print(f"[persist] save={((time.perf_counter() - t_save) * 1000):.0f}ms (background)")
+
+
 def _build_conversation(input_image: Image.Image, reference_image: Optional[Image.Image], instruction: str):
     conversation = [
         {
@@ -384,6 +467,7 @@ def _select_bbox(detections, point_px):
 
 @app.post("/predict")
 async def predict(
+    background_tasks: BackgroundTasks,
     input_image: UploadFile = File(...),
     reference_image: Optional[UploadFile] = File(None),
     instruction: Optional[str] = Form(None),
@@ -484,70 +568,30 @@ async def predict(
 
     if LOGGING_ENABLED:
         ts_now = time.time()
-        t_send_start = time.perf_counter()
-        input_saved = _save_image_bytes(input_bytes, input_image.filename)
-        ref_saved = (
-            _save_image_bytes(ref_bytes, reference_image.filename)
-            if ref_bytes is not None and reference_image is not None
-            else None
+        background_tasks.add_task(
+            _persist_request_artifacts,
+            input_bytes=input_bytes,
+            input_filename=input_image.filename,
+            ref_bytes=ref_bytes,
+            ref_filename=reference_image.filename if reference_image else None,
+            img=img,
+            detections=detections,
+            point_px=point_px,
+            selected_bbox=selected_bbox,
+            source=source,
+            pred=pred,
+            instruction=instruction,
+            score_threshold=score_threshold,
+            response=response,
+            ts_now=ts_now,
+            t_start=t_start,
+            upload_ms=upload_ms,
+            forward_ms=forward_ms,
+            post_ms=post_ms,
         )
-        try:
-            overlay_saved = _save_overlay(
-                base_image=img,
-                detections=detections,
-                point_px=point_px,
-                selected_bbox=selected_bbox,
-                bbox_source=source,
-                input_sha=Path(input_saved).stem,
-                request_ts=ts_now,
-            )
-        except Exception as e:
-            print(f"[log] failed to save overlay: {e}")
-            overlay_saved = None
-
-        attn_overlay_saved = None
-        if pred.get("attn_scores") is not None and pred.get("n_width") and pred.get("n_height"):
-            try:
-                attn_overlay_saved = _save_attn_heatmap(
-                    base_image=img,
-                    attn_scores=pred["attn_scores"],
-                    n_width=pred["n_width"],
-                    n_height=pred["n_height"],
-                    point_px=point_px,
-                    selected_bbox=selected_bbox,
-                    input_sha=Path(input_saved).stem,
-                    request_ts=ts_now,
-                )
-            except Exception as e:
-                print(f"[log] failed to save attn heatmap: {e}")
-
-        _log_request({
-            "ts": ts_now,
-            "latency_s": round(ts_now - t_start, 3),
-            "timings_ms": {
-                "upload": round(upload_ms, 1),
-                "forward": round(forward_ms, 1),
-                "post": round(post_ms, 1),
-                "total": round((ts_now - t_start) * 1000, 1),
-            },
-            "request": {
-                "input_image_file": input_saved,
-                "input_image_filename": input_image.filename,
-                "reference_image_file": ref_saved,
-                "reference_image_filename": reference_image.filename if reference_image else None,
-                "instruction": instruction,
-                "score_threshold": score_threshold,
-            },
-            "overlay_file": overlay_saved,
-            "attn_overlay_file": attn_overlay_saved,
-            "response": response,
-        })
-        save_ms = (time.perf_counter() - t_send_start) * 1000
-    else:
-        save_ms = 0.0
 
     total_ms = (time.time() - t_start) * 1000
     print(f"[predict] done upload={upload_ms:.0f}ms forward={forward_ms:.0f}ms "
-          f"post={post_ms:.0f}ms save={save_ms:.0f}ms total={total_ms:.0f}ms")
+          f"post={post_ms:.0f}ms total={total_ms:.0f}ms (save deferred)")
 
     return response
