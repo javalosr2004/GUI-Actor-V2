@@ -26,7 +26,7 @@ os.environ.setdefault("USE_FLAX", "0")
 from gui_actor.constants import chat_template  # noqa: F401  (imported for parity with demo/app.py)
 
 
-MAX_PIXELS = 1280 * 720
+MAX_PIXELS = 1920 * 1080
 
 LOG_DIR = Path(os.environ.get("PREDICT_LOG_DIR",
                Path(__file__).resolve().parent / "logs"))
