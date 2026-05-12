@@ -52,6 +52,7 @@ async def lifespan(app: FastAPI):
         gui_actor_id = "microsoft/GUI-Actor-7B-Qwen2.5-VL"
         device_map = "cuda"
         device = "cuda"
+        attn_implementation = "flash_attention_2"
     else:
         gui_actor_id = "microsoft/GUI-Actor-3B-Qwen2.5-VL"
         device_map = "cpu"
@@ -269,7 +270,8 @@ def _save_attn_heatmap(
         return np.stack([r, g, b], axis=-1)
 
     colored = (jet(norm) * 255).astype(np.uint8)
-    heat = Image.fromarray(colored, "RGB").resize((w, h), resample=Image.BILINEAR)
+    heat = Image.fromarray(colored, "RGB").resize(
+        (w, h), resample=Image.BILINEAR)
     blended = Image.blend(base_image.convert("RGB"), heat, alpha=0.5)
 
     draw = ImageDraw.Draw(blended)
