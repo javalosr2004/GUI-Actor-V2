@@ -26,7 +26,7 @@ os.environ.setdefault("USE_FLAX", "0")
 from gui_actor.constants import chat_template  # noqa: F401  (imported for parity with demo/app.py)
 
 
-MAX_PIXELS = 1920 * 1080
+MAX_PIXELS = 1280 * 720
 
 LOG_DIR = Path(os.environ.get("PREDICT_LOG_DIR",
                Path(__file__).resolve().parent / "logs"))
@@ -51,7 +51,6 @@ async def lifespan(app: FastAPI):
         gui_actor_id = "microsoft/GUI-Actor-7B-Qwen2.5-VL"
         device_map = "cuda"
         device = "cuda"
-        attn_implementation = "sdpa"
     else:
         gui_actor_id = "microsoft/GUI-Actor-3B-Qwen2.5-VL"
         device_map = "cpu"
