@@ -1,3 +1,10 @@
+from ui_detr import UIDetr
+from gui_actor.modeling_qwen25vl import Qwen2_5_VLForConditionalGenerationWithPointer
+from gui_actor.inference import inference
+from transformers import AutoProcessor
+from PIL import Image, ImageDraw
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+import torch
 import hashlib
 import io
 import json
@@ -15,20 +22,14 @@ os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("USE_FLAX", "0")
 
-import torch
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from PIL import Image, ImageDraw
-from transformers import AutoProcessor
 
 from gui_actor.constants import chat_template  # noqa: F401  (imported for parity with demo/app.py)
-from gui_actor.inference import inference
-from gui_actor.modeling_qwen25vl import Qwen2_5_VLForConditionalGenerationWithPointer
 
-from ui_detr import UIDetr
 
 MAX_PIXELS = 1920 * 1080
 
-LOG_DIR = Path(os.environ.get("PREDICT_LOG_DIR", Path(__file__).resolve().parent / "logs"))
+LOG_DIR = Path(os.environ.get("PREDICT_LOG_DIR",
+               Path(__file__).resolve().parent / "logs"))
 LOG_IMAGES_DIR = LOG_DIR / "images"
 LOG_OVERLAYS_DIR = LOG_DIR / "overlays"
 LOG_JSONL = LOG_DIR / "requests.jsonl"
@@ -45,10 +46,12 @@ def resize_image(image: Image.Image, resize_to_pixels: int = MAX_PIXELS) -> Imag
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    attn_implementation = None
     if torch.cuda.is_available():
         gui_actor_id = "microsoft/GUI-Actor-7B-Qwen2.5-VL"
         device_map = "cuda"
         device = "cuda"
+        attn_implementation = "sdpa"
     else:
         gui_actor_id = "microsoft/GUI-Actor-3B-Qwen2.5-VL"
         device_map = "cpu"
@@ -61,6 +64,7 @@ async def lifespan(app: FastAPI):
         gui_actor_id,
         torch_dtype=torch.float16,
         device_map=device_map,
+        attn_implementation=attn_implementation
     ).eval()
     print("[startup] GUI-Actor loaded")
 
@@ -100,11 +104,13 @@ async def _read_image(upload: UploadFile):
     re-encoding (which would change the digest)."""
     data = await upload.read()
     if not data:
-        raise HTTPException(status_code=400, detail=f"Empty upload: {upload.filename}")
+        raise HTTPException(
+            status_code=400, detail=f"Empty upload: {upload.filename}")
     try:
         img = Image.open(io.BytesIO(data)).convert("RGB")
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not decode image {upload.filename}: {e}")
+        raise HTTPException(
+            status_code=400, detail=f"Could not decode image {upload.filename}: {e}")
     return img, data
 
 
@@ -151,14 +157,17 @@ def _save_overlay(
     # Selected bbox in green (if any) — drawn after so it sits on top
     if selected_bbox is not None:
         x1, y1, x2, y2 = selected_bbox
-        color = (0, 200, 0) if bbox_source == "contained_highest_score" else (255, 140, 0)
+        color = (0, 200, 0) if bbox_source == "contained_highest_score" else (
+            255, 140, 0)
         draw.rectangle([x1, y1, x2, y2], outline=color, width=5)
-        draw.text((x1 + 4, max(0, y1 - 14)), f"selected ({bbox_source})", fill=color)
+        draw.text((x1 + 4, max(0, y1 - 14)),
+                  f"selected ({bbox_source})", fill=color)
 
     # GUI-Actor point in red, drawn last so it always shows
     px, py = point_px
     r = 10
-    draw.ellipse([px - r, py - r, px + r, py + r], outline=(255, 0, 0), width=4)
+    draw.ellipse([px - r, py - r, px + r, py + r],
+                 outline=(255, 0, 0), width=4)
     draw.line([px - r - 4, py, px + r + 4, py], fill=(255, 0, 0), width=2)
     draw.line([px, py - r - 4, px, py + r + 4], fill=(255, 0, 0), width=2)
 
@@ -203,7 +212,8 @@ def _build_conversation(input_image: Image.Image, reference_image: Optional[Imag
         },
     ]
     if reference_image is not None:
-        conversation[-1]["content"].append({"type": "image", "image": reference_image})
+        conversation[-1]["content"].append(
+            {"type": "image", "image": reference_image})
     conversation[-1]["content"].append({"type": "text", "text": instruction})
     return conversation
 
@@ -275,7 +285,8 @@ async def predict(
     if ref is not None and ref.size[0] * ref.size[1] > MAX_PIXELS:
         ref = resize_image(ref)
 
-    instruction_text = instruction.strip() if instruction and instruction.strip() else "Locate the matching UI element."
+    instruction_text = instruction.strip() if instruction and instruction.strip(
+    ) else "Locate the matching UI element."
     conversation = _build_conversation(img, ref, instruction_text)
 
     try:
@@ -288,14 +299,16 @@ async def predict(
             topk=3,
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"GUI-Actor inference failed: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"GUI-Actor inference failed: {e}")
 
     px_norm, py_norm = pred["topk_points"][0]
     w, h = img.size
     point_px = (px_norm * w, py_norm * h)
 
     if use_ui_detr:
-        detections = app.state.ui_detr.detect(img, score_threshold=score_threshold)
+        detections = app.state.ui_detr.detect(
+            img, score_threshold=score_threshold)
         selected, source = _select_bbox(detections, point_px)
         selected_bbox = selected["bbox"] if selected is not None else None
         selected_score = selected["score"] if selected is not None else None
@@ -315,7 +328,8 @@ async def predict(
             source = "no_attention_region"
         else:
             selected_bbox = attn_bbox
-            selected_score = pred["topk_values"][0] if pred.get("topk_values") else None
+            selected_score = pred["topk_values"][0] if pred.get(
+                "topk_values") else None
             source = "attention_region"
         selected_label = None
 
@@ -334,7 +348,8 @@ async def predict(
     if selected_bbox is not None:
         x1, y1, x2, y2 = selected_bbox
         response["bbox_pixel"] = {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
-        response["bbox"] = {"x1": x1 / w, "y1": y1 / h, "x2": x2 / w, "y2": y2 / h}
+        response["bbox"] = {"x1": x1 / w,
+                            "y1": y1 / h, "x2": x2 / w, "y2": y2 / h}
         response["bbox_score"] = selected_score
         response["bbox_label"] = selected_label
 
