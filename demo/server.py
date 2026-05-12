@@ -46,8 +46,8 @@ async def lifespan(app: FastAPI):
     ).eval()
     print("[startup] GUI-Actor loaded")
 
-    print("[startup] Loading UI-DETR: yuyangstatistics/UI-DETR")
-    ui_detr = UIDetr(model_id="yuyangstatistics/UI-DETR", device=device)
+    print("[startup] Loading UI-DETR: racineai/UI-DETR-1")
+    ui_detr = UIDetr(repo_id="racineai/UI-DETR-1", device=device)
     print("[startup] UI-DETR loaded")
 
     app.state.device = device

@@ -20,4 +20,4 @@ matplotlib
 fastapi
 uvicorn[standard]
 python-multipart
-timm
+rfdetr
