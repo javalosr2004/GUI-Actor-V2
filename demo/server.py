@@ -48,7 +48,7 @@ def resize_image(image: Image.Image, resize_to_pixels: int = MAX_PIXELS) -> Imag
 async def lifespan(app: FastAPI):
     attn_implementation = None
     if torch.cuda.is_available():
-        gui_actor_id = "microsoft/GUI-Actor-7B-Qwen2.5-VL"
+        gui_actor_id = "microsoft/GUI-Actor-3B-Qwen2.5-VL"
         device_map = "cuda"
         device = "cuda"
     else:
