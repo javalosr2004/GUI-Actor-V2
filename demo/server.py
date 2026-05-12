@@ -1,7 +1,11 @@
+import hashlib
 import io
+import json
 import math
 import os
+import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Optional
 
 # Prevent transformers from eagerly importing TensorFlow/Flax, which on Colab
@@ -23,6 +27,11 @@ from gui_actor.modeling_qwen25vl import Qwen2_5_VLForConditionalGenerationWithPo
 from ui_detr import UIDetr
 
 MAX_PIXELS = 1920 * 1080
+
+LOG_DIR = Path(os.environ.get("PREDICT_LOG_DIR", Path(__file__).resolve().parent / "logs"))
+LOG_IMAGES_DIR = LOG_DIR / "images"
+LOG_JSONL = LOG_DIR / "requests.jsonl"
+LOGGING_ENABLED = os.environ.get("PREDICT_LOG_DISABLED", "0") != "1"
 
 
 def resize_image(image: Image.Image, resize_to_pixels: int = MAX_PIXELS) -> Image.Image:
@@ -85,14 +94,45 @@ def health():
     }
 
 
-async def _read_image(upload: UploadFile) -> Image.Image:
+async def _read_image(upload: UploadFile):
+    """Return (PIL Image, raw bytes) so callers can both decode and hash without
+    re-encoding (which would change the digest)."""
     data = await upload.read()
     if not data:
         raise HTTPException(status_code=400, detail=f"Empty upload: {upload.filename}")
     try:
-        return Image.open(io.BytesIO(data)).convert("RGB")
+        img = Image.open(io.BytesIO(data)).convert("RGB")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not decode image {upload.filename}: {e}")
+    return img, data
+
+
+def _save_image_bytes(data: bytes, original_filename: Optional[str]) -> str:
+    """Store an uploaded image under logs/images/<sha256><ext>, deduped. Returns
+    the relative filename (not absolute path) so it stays portable in the log."""
+    LOG_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(data).hexdigest()
+    ext = ""
+    if original_filename:
+        ext = Path(original_filename).suffix.lower()
+        if ext not in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}:
+            ext = ""
+    filename = f"{digest}{ext}"
+    dest = LOG_IMAGES_DIR / filename
+    if not dest.exists():
+        dest.write_bytes(data)
+    return filename
+
+
+def _log_request(entry: dict) -> None:
+    if not LOGGING_ENABLED:
+        return
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with LOG_JSONL.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[log] failed to write request log: {e}")
 
 
 def _build_conversation(input_image: Image.Image, reference_image: Optional[Image.Image], instruction: str):
@@ -154,8 +194,13 @@ async def predict(
     instruction: Optional[str] = Form(None),
     score_threshold: float = Form(0.3),
 ):
-    img = await _read_image(input_image)
-    ref = await _read_image(reference_image) if reference_image is not None else None
+    t_start = time.time()
+    img, input_bytes = await _read_image(input_image)
+    ref_bytes: Optional[bytes] = None
+    if reference_image is not None:
+        ref, ref_bytes = await _read_image(reference_image)
+    else:
+        ref = None
 
     if img.size[0] * img.size[1] > MAX_PIXELS:
         img = resize_image(img)
@@ -202,5 +247,26 @@ async def predict(
         response["bbox"] = {"x1": x1 / w, "y1": y1 / h, "x2": x2 / w, "y2": y2 / h}
         response["bbox_score"] = selected["score"]
         response["bbox_label"] = selected["label"]
+
+    if LOGGING_ENABLED:
+        input_saved = _save_image_bytes(input_bytes, input_image.filename)
+        ref_saved = (
+            _save_image_bytes(ref_bytes, reference_image.filename)
+            if ref_bytes is not None and reference_image is not None
+            else None
+        )
+        _log_request({
+            "ts": time.time(),
+            "latency_s": round(time.time() - t_start, 3),
+            "request": {
+                "input_image_file": input_saved,
+                "input_image_filename": input_image.filename,
+                "reference_image_file": ref_saved,
+                "reference_image_filename": reference_image.filename if reference_image else None,
+                "instruction": instruction,
+                "score_threshold": score_threshold,
+            },
+            "response": response,
+        })
 
     return response
