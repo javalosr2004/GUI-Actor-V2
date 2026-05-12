@@ -272,6 +272,10 @@ async def predict(
     use_ui_detr: bool = Form(False),
 ):
     t_start = time.time()
+    print(f"[predict] hit @ {time.strftime('%H:%M:%S')} "
+          f"use_ui_detr={use_ui_detr} threshold={score_threshold}")
+
+    t_upload_start = time.perf_counter()
     img, input_bytes = await _read_image(input_image)
     ref_bytes: Optional[bytes] = None
     if reference_image is not None:
@@ -283,11 +287,13 @@ async def predict(
         img = resize_image(img)
     if ref is not None and ref.size[0] * ref.size[1] > MAX_PIXELS:
         ref = resize_image(ref)
+    upload_ms = (time.perf_counter() - t_upload_start) * 1000
 
     instruction_text = instruction.strip() if instruction and instruction.strip(
     ) else "Locate the matching UI element."
     conversation = _build_conversation(img, ref, instruction_text)
 
+    t_fwd_start = time.perf_counter()
     try:
         pred = inference(
             conversation,
@@ -300,7 +306,9 @@ async def predict(
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"GUI-Actor inference failed: {e}")
+    forward_ms = (time.perf_counter() - t_fwd_start) * 1000
 
+    t_post_start = time.perf_counter()
     px_norm, py_norm = pred["topk_points"][0]
     w, h = img.size
     point_px = (px_norm * w, py_norm * h)
@@ -352,8 +360,11 @@ async def predict(
         response["bbox_score"] = selected_score
         response["bbox_label"] = selected_label
 
+    post_ms = (time.perf_counter() - t_post_start) * 1000
+
     if LOGGING_ENABLED:
         ts_now = time.time()
+        t_send_start = time.perf_counter()
         input_saved = _save_image_bytes(input_bytes, input_image.filename)
         ref_saved = (
             _save_image_bytes(ref_bytes, reference_image.filename)
@@ -377,6 +388,12 @@ async def predict(
         _log_request({
             "ts": ts_now,
             "latency_s": round(ts_now - t_start, 3),
+            "timings_ms": {
+                "upload": round(upload_ms, 1),
+                "forward": round(forward_ms, 1),
+                "post": round(post_ms, 1),
+                "total": round((ts_now - t_start) * 1000, 1),
+            },
             "request": {
                 "input_image_file": input_saved,
                 "input_image_filename": input_image.filename,
@@ -388,5 +405,12 @@ async def predict(
             "overlay_file": overlay_saved,
             "response": response,
         })
+        save_ms = (time.perf_counter() - t_send_start) * 1000
+    else:
+        save_ms = 0.0
+
+    total_ms = (time.time() - t_start) * 1000
+    print(f"[predict] done upload={upload_ms:.0f}ms forward={forward_ms:.0f}ms "
+          f"post={post_ms:.0f}ms save={save_ms:.0f}ms total={total_ms:.0f}ms")
 
     return response
